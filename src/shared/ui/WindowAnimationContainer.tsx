@@ -1,5 +1,6 @@
 import { type ReactNode } from "react";
 import { create } from "zustand";
+import { onWindowVisibilityChange } from "@/shared/utils/windowVisibility";
 
 export type WindowAnimationPhase = "idle" | "closing";
 
@@ -32,6 +33,14 @@ export const useWindowAnimationStore = create<WindowAnimationStore>(
     },
   }),
 );
+
+// with background play the close button only hides the window, so the app keeps
+// running; clear the faded-out "closing" state as soon as the window is hidden
+// (or shown again), otherwise the transparent window reopens fully see-through
+onWindowVisibilityChange(() => {
+  if (useWindowAnimationStore.getState().phase !== "idle")
+    useWindowAnimationStore.setState({ phase: "idle" });
+});
 
 export function WindowAnimationContainer({
   children,
