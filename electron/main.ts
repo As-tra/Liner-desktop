@@ -66,6 +66,7 @@ import {
   withEdgeHeaders,
 } from "./edge-headers.js";
 import { createShutdown } from "./shutdown.js";
+import { BackgroundPlayTray, shouldHideOnClose } from "./background-play.js";
 import {
   clampResizeToArea,
   computeDragBounds,
@@ -147,6 +148,7 @@ let thumbar: ThumbarController | null = null;
 let bundleManager: BundleManager | null = null;
 let discordRpcManager: DiscordRpcManager | null = null;
 let poTokenService: PoTokenService | null = null;
+let backgroundTray: BackgroundPlayTray | null = null;
 let windowStateStore: ReturnType<typeof createWindowStateStore> | null = null;
 
 function getWindowStateStore() {
@@ -215,6 +217,10 @@ function unmaximizeWindow() {
 const shutdown = createShutdown({
   cleanup: [
     () => touchBarManager?.unregisterShortcut(),
+    () => {
+      backgroundTray?.destroy();
+      backgroundTray = null;
+    },
     () => overlayManager?.dispose(),
     () => {
       // drop the discord ipc socket so presence clears and nothing keeps the process alive
@@ -280,6 +286,34 @@ const DEFAULT_WINDOW_WIDTH = 1200;
 const DEFAULT_WINDOW_HEIGHT = 780;
 const MIN_WINDOW_WIDTH = 1100;
 const MIN_WINDOW_HEIGHT = 705;
+
+// background play: bring the hidden main window back (or rebuild it if it was
+// really closed), used by the tray icon
+function showMainWindow() {
+  if (shutdown.isQuitting()) return;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+// hides instead of closing so the renderer, and the audio it plays, keeps running
+function hideMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const win = mainWindow;
+  // a hidden native-fullscreen window leaves an empty fullscreen space behind on macos
+  if (win.isFullScreen()) {
+    win.once("leave-full-screen", () => {
+      if (!win.isDestroyed()) win.hide();
+    });
+    win.setFullScreen(false);
+    return;
+  }
+  win.hide();
+}
 
 function createWindow() {
   const windowState = getWindowStateStore();
@@ -402,6 +436,27 @@ function createWindow() {
   mainWindow.on("maximize", trackWindowState);
   mainWindow.on("unmaximize", trackWindowState);
   mainWindow.on("close", () => windowState.flush(mainWindowSnapshot));
+  // background play: the close button / alt+f4 / cmd+w hide the window and
+  // playback continues; a real quit (tray, cmd+q, updater, os shutdown) has
+  // already marked the shutdown as started, so the window closes normally then
+  mainWindow.on("close", (event) => {
+    if (
+      !shouldHideOnClose({
+        enabled: backgroundTray?.isEnabled() ?? false,
+        quitting: shutdown.isQuitting(),
+        trayAvailable: backgroundTray?.isAvailable() ?? false,
+        platform: process.platform,
+      })
+    )
+      return;
+    event.preventDefault();
+    hideMainWindow();
+  });
+  // windows does not emit before-quit on logoff / shutdown, so mark it here
+  // to let the close go through instead of being turned into a hide
+  mainWindow.on("session-end", () => shutdown.begin());
+  mainWindow.on("show", () => backgroundTray?.refresh());
+  mainWindow.on("hide", () => backgroundTray?.refresh());
   mainWindow.on("minimize", () => {
     broadcastWindowState();
     if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -615,12 +670,30 @@ if (!gotTheLock) {
       "touchbar:update-state",
       (_event, state: { status: string; track?: unknown }) => {
         updateSleepBlocker(state.status);
+        backgroundTray?.setStatus(state.status);
         poTokenService?.setPlaybackActive(
           state.status === "playing" || state.status === "loading",
         );
         thumbar?.update(state);
       },
     );
+
+    backgroundTray = new BackgroundPlayTray({
+      iconPath: path.join(process.env.VITE_PUBLIC!, "icon.png"),
+      settingsPath: path.join(app.getPath("userData"), "background-play.json"),
+      isWindowVisible: () =>
+        Boolean(
+          mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible(),
+        ),
+      showWindow: showMainWindow,
+      hideWindow: hideMainWindow,
+      sendAction: (type) => {
+        if (mainWindow && !mainWindow.isDestroyed())
+          mainWindow.webContents.send("overlay:action", { type });
+      },
+      quit: () => shutdown.quit(),
+    });
+    backgroundTray.create();
 
     overlayManager = new OverlayManager(
       path.join(__dirname, "preload.cjs"),
@@ -2077,11 +2150,16 @@ if (!gotTheLock) {
     }
 
     app.on("activate", () => {
-      if (
-        !shutdown.isQuitting() &&
-        BrowserWindow.getAllWindows().length === 0
-      ) {
+      if (shutdown.isQuitting()) return;
+      if (BrowserWindow.getAllWindows().length === 0) {
         createWindow();
+      } else if (
+        mainWindow &&
+        !mainWindow.isDestroyed() &&
+        !mainWindow.isVisible()
+      ) {
+        // dock click while the window is hidden for background play
+        showMainWindow();
       }
     });
   });
