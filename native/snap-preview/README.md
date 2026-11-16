@@ -16,7 +16,7 @@ and a Windows 10/11 SDK.
 
     pnpm native:build
 
-Output: `native/snap-preview/build/Release/snap_preview.node`. If it is missing or
+Output: `native/snap-preview/build/Release/snap_preview.node`. If its missing or
 fails to load, the app falls back to a simpler preview (see `electron/snap-native.ts`).
 
 Without the C++ tools, `pnpm native:build` (and so `pnpm electron:build:win`) only
